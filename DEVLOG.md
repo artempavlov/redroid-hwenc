@@ -1963,3 +1963,35 @@ now, but bug 2's `setprop`+`pkill mediaserver` dance still has to be done by han
 boot — needs an init-time property (`redroid.c2.rc`-style, gated on a boot cmdline flag like
 `use_redroid_c2` already is) instead of a runtime workaround, so a real deployment doesn't need a
 human in the loop for this.
+
+## 2026-09-29 (same session, continued) — Tier 5.13 fix itself had a use-after-free; found and fixed before it ever landed clean
+
+The CSD fix above (`findLeadingParameterSetsSize` + `C2StreamInitDataInfo`) worked on its very
+first deploy — then failed again on the *next* fresh instance, with `mCsdSent` logged as `0` on
+every single frame (never flipping to `1`) despite `findLeadingParameterSetsSize()` correctly
+returning a non-zero size (`22`, confirmed via temporary `ALOGD` instrumentation dumping
+`codedSize`/`mCsdSent`/the computed size/the first 32 bytes). Root cause, visible once the actual
+code was re-read rather than assumed correct: the CSD-extraction block had been placed *after*
+`free(coded)` — a plain use-after-free. Freed memory isn't always immediately overwritten, which is
+exactly why the very first test (against a different container, moments after `free()`) happened to
+still read valid bytes and worked, while a later one didn't — a textbook "worked by accident,
+broke on the next run" UAF signature. Fixed by building the whole `C2StreamInitDataInfo` object
+(scan **and** `memcpy`) immediately after `encodeViaDaemon()` returns, while `coded` is still valid,
+and only pushing it onto `work->worklets.front()->output.configUpdate` at the very end alongside the
+frame buffer — `coded` is freed exactly once, after both consumers are done with it, not before.
+
+**Second bug, same session**: re-testing end to end against a *freshly recreated* instance (not the
+one every earlier fix had been hot-patched into) reproduced the exact striped/banded corruption
+Tier 5.7 already diagnosed and fixed — `AMD_DEBUG=nodcc` was absent from `surfaceflinger`'s own
+environment on this fresh boot. `init`'s own log gave the exact reason:
+`Skipping insecure file` for `/vendor/etc/init/redroid-nodcc.rc`, permissions `-rw-rw-r--`
+(0664) instead of the `-rw-r--r--` (0644) Tier 5.7's own entry already named as the requirement —
+the file (authored fresh for the `redroid-forge` module integration, not `docker cp`'d from an
+already-0644 AOSP build artifact this time) picked up the host's default umask instead. Confirms
+Tier 5.7's lesson generalizes beyond "watch out for `docker cp`" specifically: **any** file placed
+under `/vendor/etc/init/` needs `chmod 0644` explicitly checked, regardless of how it got there.
+
+Both fixed, then the full loop re-run end to end (new container from the official image, module's
+own `integrate()` + `ensureHwencReady()`, no manual patching) three times in a row without a single
+config-packet error or corrupted frame — confirmed via `ffprobe` and a decoded frame comparison
+each time.

@@ -304,6 +304,24 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
         work->workletsProcessed = 1u;
         return;
     }
+    // El CSD se arma aca, mientras "coded" todavia es valido -- armarlo
+    // despues de free(coded) mas abajo (como quedo en un primer intento) es
+    // un use-after-free: a veces devuelve el tamano correcto igual (la
+    // memoria liberada no siempre se pisa de inmediato) y a veces
+    // silenciosamente 0/basura, dependiendo de que mas haya tocado ese
+    // bloque mientras tanto. Confirmado con logging temporal el 29/09.
+    std::unique_ptr<C2StreamInitDataInfo::output> csd;
+    if (!mCsdSent) {
+        size_t csdSize = findLeadingParameterSetsSize(coded, (size_t)codedSize);
+        if (csdSize > 0) {
+            csd = C2StreamInitDataInfo::output::AllocUnique(csdSize, 0u);
+            if (!csd) {
+                ALOGE("CSD allocation failed (%zu bytes)", csdSize);
+            } else {
+                memcpy(csd->m.value, coded, csdSize);
+            }
+        }
+    }
 
     std::shared_ptr<C2LinearBlock> outBlock;
     C2MemoryUsage usage = {C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE};
@@ -332,20 +350,11 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     outBuffer->setInfo(
             std::make_shared<C2StreamPictureTypeMaskInfo::output>(0u, C2Config::SYNC_FRAME));
 
-    if (!mCsdSent) {
-        size_t csdSize = findLeadingParameterSetsSize(coded, (size_t)codedSize);
-        if (csdSize > 0) {
-            std::unique_ptr<C2StreamInitDataInfo::output> csd =
-                    C2StreamInitDataInfo::output::AllocUnique(csdSize, 0u);
-            if (!csd) {
-                ALOGE("CSD allocation failed (%zu bytes)", csdSize);
-            } else {
-                memcpy(csd->m.value, coded, csdSize);
-                work->worklets.front()->output.configUpdate.push_back(std::move(csd));
-                mCsdSent = true;
-                ALOGD("sent %zu bytes of SPS/PPS as CSD", csdSize);
-            }
-        }
+    if (csd) {
+        size_t sentSize = csd->flexCount();
+        work->worklets.front()->output.configUpdate.push_back(std::move(csd));
+        mCsdSent = true;
+        ALOGD("sent %zu bytes of SPS/PPS as CSD", sentSize);
     }
 
     work->worklets.front()->output.flags = (C2FrameData::flags_t)0;
