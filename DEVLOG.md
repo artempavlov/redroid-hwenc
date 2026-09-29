@@ -1887,3 +1887,79 @@ was eventually proven against a real `Surface`-fed `GraphicBufferSource`. Needs 
 containing video source and something to drive a decoder component with it; `tier5-vaapi-daemon/
 codec2-component/component_test.cpp`/`client_test.cpp` are the encode-side precedents to model a
 decode-side equivalent on.
+
+## 2026-09-28/29 — Tier 5.13: real app integration finally validated end to end against the *official* redroid image, three real bugs found and fixed
+
+Context: `redroid-forge` (the consolidation project) needed to confirm the whole Tier 5 pipeline
+works when integrated as a **module** (files copied into an already-existing container before its
+first boot) against the plain, official `redroid/redroid:15.0.0-latest` image — not the custom
+`redroid-jg-15` AOSP builds every earlier tier tested against. This surfaced three real, previously
+undiscovered bugs, none of them specific to the official image — they'd have hit the custom builds
+too, just never got exercised because nobody had driven a real consumer (`scrcpy`) against a truly
+fresh boot with the framework's real component-discovery path since Tier 5.6.
+
+**Bug 1 — service registers as `/vaapi`, not `/default`.** `service.cpp`'s `getName()` and its AIDL
+`serviceName` were `"vaapi"`/`"IComponentStore/vaapi"`. Tier 5.6's own DEVLOG entry (2026-09-21)
+already documented that the Framework Compatibility Matrix only accepts `default[0-9]*` or
+`vendor[0-9]*_software` for this HAL — but the actual fix apparently never landed in this file (or
+got reverted by the `aosp-out-redroid15.tar`/`aosp-redroid-15.tar` restore mentioned in Tier 4's own
+entry). Renamed both to `"default"` — `service.cpp`'s `getName()`/`serviceName`, and
+`manifest_media_c2_vaapi.xml`'s `<fqname>`, now finally in this repo at
+`tier5-vaapi-daemon/service/` (never checked in before this session; only the stale Tier 4 stub
+under `tier4-codec2-skeleton/` existed).
+
+**Bug 2 — `media.c2.hal.selection` defaults to `"hidl"`, and the AIDL selection code path
+(`#if 0`'d out) that would normally gate this via a real aconfig flag never compiles in this
+build.** `Codec2Client::CacheServiceNames()` branches on `IsCodec2AidlHalSelected()`
+(`frameworks/av/media/codec2/hal/common/HalSelection.cpp`) — when false, it goes down the *HIDL*
+`IServiceManager::listManifestByInterface()` path and never looks at AIDL-registered instances at
+all, regardless of anything else being correct. The real gate in this build (the aconfig-based one
+is dead code, "due to dependency from mainline modules cannot use libsysprop") is a plain
+`GetProperty("media.c2.hal.selection", "hidl")` check. `setprop media.c2.hal.selection aidl` +
+restarting `mediaserver` (so its own cached `GetServiceNames()` — a function-local `static` — gets
+recomputed) is required on every fresh boot; this isn't persisted anywhere in the image or an init
+script yet. Confirmed via `vaapi_c2client_test` (the Tier 4 diagnostic binary, still works): before
+the setprop, `Codec2Client::ListComponents()` returned only the 32 software components; after,
+`c2.hardware.encoder.h264`/`c2.hardware.decoder.h264 owner=default` both appear.
+
+**Bug 3 — `VaapiEncComponent` never emits a CSD (`C2StreamInitDataInfo::output`).** The daemon's
+returned Annex-B bytes do contain valid SPS/PPS NALs inline (confirmed: live-display `scrcpy`,
+which decodes the raw bytestream directly without ever checking for a separately-flagged config
+buffer, decoded correctly with zero fixes needed here) — but `process()` always sent
+`output.flags = 0` and never populated `configUpdate`. Any consumer that *does* require an
+explicit `BUFFER_FLAG_CODEC_CONFIG` buffer before accepting frame data — `scrcpy`'s own MP4
+recorder/muxer is the concrete case that surfaced this — fails immediately with "the first video
+packet is not a config packet", even though the underlying bitstream was never actually broken.
+Root cause: this component's `process()` is a `SimpleC2Component`-style fully-synchronous
+round trip to a daemon that returns one opaque combined buffer per call — unlike
+`C2SoftAvcEnc` (the reference this component's own header comment points to), it never had a
+distinct "get me just the header" mode to key a `mSpsPpsHeaderReceived`-style flag off of.
+
+Fix: `findLeadingParameterSetsSize()` (new, `VaapiEncComponent.cpp`) does a plain Annex-B scan
+(searches for the `00 00 01` start-code suffix, which also matches inside a 4-byte `00 00 00 01`
+prefix — a standard simplification, confirmed correct here since we're only using it to find where
+the *next* NAL begins, not to preserve the original prefix length) and returns where the leading
+run of parameter-set NALs (type 7=SPS, 8=PPS) ends. On the *first* successful encode only
+(`mCsdSent`, same one-shot pattern as `C2SoftAvcEnc::mSpsPpsHeaderReceived`), that leading span is
+copied into a `C2StreamInitDataInfo::output` and pushed onto `work->worklets.front()->
+output.configUpdate` — the frame buffer itself is sent unchanged (SPS/PPS stay embedded in it too,
+harmless duplication, and keeps the already-working live-decode path exactly as-is).
+
+**Confirmed end to end**: `scrcpy --video-encoder=c2.hardware.encoder.h264 --record=out.mp4`
+against the official image, previously failing immediately with the config-packet error, now
+records a valid file — `ffprobe` reads it as real, correctly-profiled H.264
+(`Constrained Baseline, 720x1280, 10fps`), and the extracted first frame decodes to a clean,
+uncorrupted Android home screen (no DCC/tiling artifacts — `AMD_DEBUG=nodcc` via
+`redroid-nodcc.rc`, Tier 5.7's own fix, was already in place and still required; not itself part of
+this session's bugs).
+
+**Also newly checked into this repo, never committed before**: `tier5-vaapi-daemon/service/`
+(the real Tier 5.5+ `service.cpp`/manifest/`.rc`/seccomp policy — previously only existed inside
+the AOSP checkout, at risk of being lost the same way the Tier 5.6 naming fix apparently was) and
+`redroid-nodcc.rc` (Tier 5.7's guest-side fix, same situation).
+
+**Still open, deliberately not automated yet**: bugs 1 and 3's fixes are in the AOSP source/build
+now, but bug 2's `setprop`+`pkill mediaserver` dance still has to be done by hand after every fresh
+boot — needs an init-time property (`redroid.c2.rc`-style, gated on a boot cmdline flag like
+`use_redroid_c2` already is) instead of a runtime workaround, so a real deployment doesn't need a
+human in the loop for this.

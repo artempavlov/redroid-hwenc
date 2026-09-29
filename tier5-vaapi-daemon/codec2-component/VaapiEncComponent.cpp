@@ -82,6 +82,35 @@ C2R VaapiEncInterface::SizeSetter(bool mayBlock, const C2P<C2StreamPictureSizeIn
     return res;
 }
 
+// Recorre un stream Annex-B (delimitado por start codes "00 00 01", que
+// tambien cubre el sufijo de un start code de 4 bytes "00 00 00 01") y
+// devuelve el offset donde termina el bloque inicial de parameter sets
+// (SPS=7 / PPS=8) -- es decir, el limite entre lo que hay que mandar como
+// CSD (C2StreamInitDataInfo) y el primer NAL que no es parameter set.
+// Devuelve 0 si el buffer no arranca con un parameter set (nada que
+// extraer para este frame -- ya se mando el CSD en uno anterior).
+static size_t findLeadingParameterSetsSize(const unsigned char *data, size_t size) {
+    size_t pos = 0;
+    while (pos + 4 <= size) {
+        size_t scPos = size;
+        for (size_t i = pos; i + 3 <= size; i++) {
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                scPos = i;
+                break;
+            }
+        }
+        if (scPos == size) break;
+        size_t nalStart = scPos + 3;
+        if (nalStart >= size) break;
+        uint8_t nalType = data[nalStart] & 0x1F;
+        if (nalType != 7 && nalType != 8) {
+            return scPos;
+        }
+        pos = nalStart + 1;
+    }
+    return pos >= size ? size : 0;
+}
+
 VaapiEncComponent::VaapiEncComponent(const char *name, c2_node_id_t id,
                                       const std::shared_ptr<VaapiEncInterface> &intf)
     : SimpleC2Component(std::make_shared<SimpleInterface<VaapiEncInterface>>(name, id, intf)),
@@ -95,7 +124,9 @@ c2_status_t VaapiEncComponent::onStop() {
     return C2_OK;
 }
 
-void VaapiEncComponent::onReset() {}
+void VaapiEncComponent::onReset() {
+    mCsdSent = false;
+}
 
 void VaapiEncComponent::onRelease() {}
 
@@ -300,6 +331,22 @@ void VaapiEncComponent::process(const std::unique_ptr<C2Work> &work,
     std::shared_ptr<C2Buffer> outBuffer = createLinearBuffer(outBlock, 0, codedSize);
     outBuffer->setInfo(
             std::make_shared<C2StreamPictureTypeMaskInfo::output>(0u, C2Config::SYNC_FRAME));
+
+    if (!mCsdSent) {
+        size_t csdSize = findLeadingParameterSetsSize(coded, (size_t)codedSize);
+        if (csdSize > 0) {
+            std::unique_ptr<C2StreamInitDataInfo::output> csd =
+                    C2StreamInitDataInfo::output::AllocUnique(csdSize, 0u);
+            if (!csd) {
+                ALOGE("CSD allocation failed (%zu bytes)", csdSize);
+            } else {
+                memcpy(csd->m.value, coded, csdSize);
+                work->worklets.front()->output.configUpdate.push_back(std::move(csd));
+                mCsdSent = true;
+                ALOGD("sent %zu bytes of SPS/PPS as CSD", csdSize);
+            }
+        }
+    }
 
     work->worklets.front()->output.flags = (C2FrameData::flags_t)0;
     work->worklets.front()->output.buffers.clear();
