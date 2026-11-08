@@ -49,9 +49,10 @@ subfolder README, linked below.
 - [x] **Tier 2 — Isolated native prototype.** Standalone host program encodes real H.264 via VA-API. → [tier2-vaapi-encode/](tier2-vaapi-encode/)
 - [x] **Tier 3 — ⭐ The make-or-break spike.** Confirmed a gralloc dma-buf imports zero-copy into VA-API inside a real redroid container — across three GPUs — the exact question 4 years of upstream issues never answered. → [tier3-dmabuf-import/README.md](tier3-dmabuf-import/README.md)
 - [x] **Tier 4 — Codec2 skeleton in Android.** A component Android recognizes and lists via `dumpsys media.c2`, no real encoding wired in yet. → [tier4-codec2-skeleton/README.md](tier4-codec2-skeleton/README.md)
-- [x] **Tier 5 — ⭐ Real integration. The actual goal.** A real, unmodified app (`scrcpy`) records correct hardware-encoded H.264 through the genuine framework path — confirmed on 3 GPUs across AMD/Intel (see Hardware compatibility below). → [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md)
+- [x] **Tier 5 — ⭐ Real integration. The actual goal.** A real, unmodified app (`scrcpy`) records correct hardware-encoded H.264 through the genuine framework path — confirmed on 3 GPUs across AMD/Intel (see Hardware compatibility below). Later additions: real P frames (5.14, broken on Intel), vendor-agnostic hardware decode for apps (5.15), and a second, libavcodec-based encode backend that fixes the Intel P-frame bug (5.16). → [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md)
 - [x] **Tier 6 (conditional on Tier 0).** Turned out unnecessary — Tier 0 already confirmed codec selection is capability-based, so `scrcpy` picks up the new encoder automatically.
 - [x] **Tier 7 — ⭐ Hardware video decode, a fourth GPU (NVIDIA).** Bit-exact NVDEC decode via VA-API, fully wired into the daemon and a real `c2.hardware.decoder.h264` Codec2 component (see Hardware compatibility below). **Next**: the real-device `MediaCodec` test, the same milestone Tier 5 needed for encode. → [tier6-vaapi-decode/README.md](tier6-vaapi-decode/README.md), [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md)
+- [ ] **Tier 8 — Android 11/12/13 (HIDL Codec2), ⚠ work in progress.** AIDL Codec2 (what Tiers 4–7 are built on) does not exist before Android 14 — confirmed against AOSP source at android-11.0.0_r48, 12.0.0_r34 and 13.0.0_r83. A HIDL port of the same component, plus a kernel-level `libion.so` fix these older AOSP versions need on any modern host kernel, gets the same hardware encode working — **confirmed end to end, but only on AMD** (Ryzen 5700G/Renoir). **Intel is confirmed broken**, not just untested: a real, malformed-bitstream bug (`Overread SPS by N bits`), still being investigated as of 08/11/2026 — not assumed to be the same root cause as 5.14's Intel P-frame bug (this component passes through the driver's own coded bytes rather than writing them by hand), so 5.16's ffmpeg rewrite is not assumed to be the fix without checking first. → [tier8-android11-13-hidl/README.md](tier8-android11-13-hidl/README.md)
 
 Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
 has been documented by anyone until now.
@@ -64,9 +65,13 @@ and DEVLOG.md for what each GPU's own fix actually was.
 
 | GPU | Architecture | Status | Notes |
 |---|---|---|---|
-| AMD Renoir (Ryzen APU, integrated) | GFX9 | **Full pipeline works** | Reference implementation. |
-| AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Full pipeline works** | No DRM modifier available for this GPU/format at all — needed VA-API's old pre-modifier import path. |
-| Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Full pipeline works** | Same unmodified vendor image as AMD, no rebuild. One vendor-specific tiling bug, fixed in the daemon. |
+| AMD Renoir (Ryzen APU, integrated) | GFX9 | **Full pipeline works** | Reference implementation. P frames (5.14) work; `ffmpeg` backend (5.16) also validated here. |
+| AMD Radeon RX 480 (Polaris, discrete) | GFX8 | **Full pipeline works** | No DRM modifier available for this GPU/format at all — needed VA-API's old pre-modifier import path. P frames (5.14) work. **Avoid the `ffmpeg` backend (5.16) here**: real GPU hangs during validation (timeout, full reset, one needing a host reboot) — stay on the default (`legacy`) backend. |
+| Intel Iris Xe (TigerLake-LP, integrated) | Gen12 | **Full pipeline works** | Same unmodified vendor image as AMD, no rebuild. One vendor-specific tiling bug, fixed in the daemon. P frames on the default (`legacy`) backend are **broken** (5.14: ~60% of frames fail to decode) — use the `ffmpeg` backend (5.16) for working P frames here. |
+
+Vendor-agnostic hardware **decode for apps** (5.15, `hwdec.c` — H.264/HEVC/VP9, separate from the
+encode table above and from Tier 7's NVIDIA-only decode): confirmed bit-exact against software
+decode on all three GPUs above, see [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md#515-vendor-agnostic-hardware-decode-hwdecc).
 
 This list is 3 machines because that's what's in this project's own reach, not a completeness
 claim. If you've got other hardware and want to help fill this in, see Contributing below — a PR

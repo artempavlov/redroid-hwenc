@@ -1995,3 +1995,55 @@ Both fixed, then the full loop re-run end to end (new container from the officia
 own `integrate()` + `ensureHwencReady()`, no manual patching) three times in a row without a single
 config-packet error or corrupted frame — confirmed via `ffprobe` and a decoded frame comparison
 each time.
+
+## 2026-11-08 — Catching this repo up: P frames, vendor-agnostic hwdec, the ffmpeg encode backend, and a new Tier 8 (Android 11-13, work in progress)
+
+This repo's own `daemon.c`/Codec2 component hadn't been touched since late September, while the
+same code kept evolving inside the `redroid-forge` integration project (same author, same code,
+just never synced back) — a real drift (975 vs. 1641 lines by the time this was caught). Brought
+all of it here in one pass, rather than catching up piecemeal later:
+
+- **5.14 — P frames for the legacy encoder** (`REDROID_FORGE_ENCODE_IDR_PERIOD`, `gop.h`,
+  `ratectl.h`): works cleanly on both AMD GPUs tested, **broken on Intel/iHD** (~60% of frames
+  fail to decode, cause not identified). This is what motivated 5.16.
+- **5.15 — vendor-agnostic hardware decode** (`hwdec.c`/`hwdec.h`): a second, independent decode
+  path (H.264/HEVC/VP9, AMD+Intel via libavcodec+VA-API) for apps in general, not just this
+  project's own screen-streaming use case. Confirmed bit-exact against software decode on all
+  three GPUs this project has access to.
+- **5.16 — the ffmpeg/`h264_vaapi` encode backend**: fixes 5.14's Intel P-frame bug by handing the
+  whole job to libavcodec instead of a hand-written slice header. Also validated on AMD Renoir.
+  **Real GPU hangs found on AMD Polaris** during validation (a soft timeout with recovery, a full
+  reset with a VM fault, and one hang with visible corruption that needed a host reboot) — not
+  safe there yet, Polaris keeps the 5.14 path.
+
+See `tier5-vaapi-daemon/README.md`'s own 5.14/5.15/5.16 sections for the full detail (GOP policy,
+rate control, the shared-memory frame transport, the exact env vars). All of this needed a
+dedicated LGPL-only FFmpeg build (`--disable-gpl`, no libx264/avformat/etc.) to stay Apache-2.0
+compatible — Alpine's own `ffmpeg` package is `--enable-gpl` and would make the whole binary GPL
+the moment it's linked in, regardless of which encoder/decoder is actually called.
+
+**New: Tier 8, Android 11/12/13 via HIDL Codec2 — confirmed working on AMD, confirmed broken on
+Intel.** AIDL Codec2 (everything Tier 4 onward is built on) does not exist before Android 14,
+confirmed by reading AOSP source directly at three tags (11, 12, 13) — Tier 8 is a HIDL port of
+the same component, registered through `hwservicemanager` instead of `servicemanager`, plus a
+second, separate fix: AOSP's own `libion.so` (`system/memory/libion/ion.c`) hardcodes
+`open("/dev/ion", ...)` with no fallback, and `/dev/ion` (legacy ION) does not exist on any host
+kernel using the modern `dma_heap` subsystem (5.10+) — confirmed byte-identical, unfixed, across
+all three AOSP versions. Patched with a `/dev/dma_heap/system` fallback.
+
+Validated end to end on AMD (Ryzen 5700G/Renoir) through `redroid-forge`'s real instance API (not
+a hand-patched container) — real VA-API hardware encode via `scrcpy`, confirmed through logcat.
+On Intel (Iris Xe), same plumbing works (boots, registers, encodes, no crash) but the bitstream
+itself is malformed: `ffprobe`/`ffmpeg` report `Overread SPS by 3 bits` on every frame, a warning
+that does not appear at all on the AMD output. Worth being precise about what this is *not*: it is
+probably not the same root cause as 5.14's Intel P-frame bug, because this component doesn't
+write SPS/PPS bytes by hand — it scans the VA-API driver's own real coded output for where the
+parameter sets end (`findLeadingParameterSetsSize`), so this reads more like a boundary-detection
+bug in that scan than a bitstream-construction bug. Tier 8 is explicitly marked work in progress
+in both READMEs until that's actually found and fixed, and until Android 12/13 are run at all (so
+far only 11 has been booted).
+
+Also found and fixed in the same validation pass: a real boot-ordering race in how the runtime
+`setprop` gets applied on Android 11 — a readiness proxy that wasn't the real
+`sys.boot_completed=1` signal let it apply with no error and then get silently reset moments
+later by a later boot step.

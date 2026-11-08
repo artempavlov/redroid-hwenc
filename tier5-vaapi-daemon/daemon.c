@@ -14,11 +14,14 @@
  * instead of allocating/filling one itself.
  */
 
+/* struct ucred (SO_PEERCRED: which process is on the other end of a connection) needs this before any include. */
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -30,7 +33,15 @@
 #include <va/va_drmcommon.h>
 #include <va/va_enc_h264.h>
 #include <va/va_vpp.h>
+/* Depending on the Alpine/Debian version, libdrm-dev puts drm_fourcc.h in <drm/...> (Alpine 3.24,
+ * Debian), only in <libdrm/...> (Alpine 3.23), or both: all cases are covered (with the -I that the
+ * Makefile adds from pkg-config). Confirmed on 06/10/2026: server01 had an alpine:latest 3.23 image
+ * cached and the build failed there, while on 3.24 it compiled. */
+#if __has_include(<drm/drm_fourcc.h>)
 #include <drm/drm_fourcc.h>
+#else
+#include <drm_fourcc.h>
+#endif
 
 #include <gbm.h>
 #define EGL_EGLEXT_PROTOTYPES
@@ -39,6 +50,16 @@
 
 #include "protocol.h"
 #include "decode_h264.h"
+#include "ratectl.h"
+#include "gop.h"
+
+#ifdef HAVE_HWDEC
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include "hwdec.h"
+#include "ffmpeg_encode.h"
+#endif
 
 #define DRM_RENDER_DEVICE "/dev/dri/renderD128"
 
@@ -141,8 +162,22 @@ static void build_sps_rbsp(bitstream_t *bs, const VAEncSequenceParameterBufferH2
         bs_put_ue(bs, seq->frame_crop_top_offset);
         bs_put_ue(bs, seq->frame_crop_bottom_offset);
     }
+    /* vui_parameters_present_flag. Reverted (30/10/2026): tried declaring the VUI colour matrix
+     * explicitly (first BT.601 to match convert_rgba_to_nv12's conversion, then BT.709 to test
+     * whether scrcpy's renderer ignores VUI and assumes a fixed matrix instead) -- neither
+     * version changed the washed-out picture reported live against cifi-nuevo-nuevo on
+     * jgustavo46, so colour matrix is being ruled out as the cause for now, isolated back out to
+     * retest the GOP/P-frames angle (REDROID_FORGE_ENCODE_IDR_PERIOD) on its own. Revisit if that
+     * doesn't fix it either -- the two VUI attempts are recoverable from git history/this comment
+     * if colour needs a second look. Deliberately NOT calling bs_rbsp_trailing_bits(bs) here:
+     * adding it (30/10/2026, same session) broke scrcpy's own SPS parsing for recording
+     * ("Failed to write header", reproducible on a warm daemon, not a cold-start race) even
+     * though the live --no-window path and the confirmed-working P-frames test both predate that
+     * change. Root cause not investigated -- reverted to match the exact bitstream the user
+     * already validated live (8Mbps and 1Mbps, both "perfecto") rather than chase it further
+     * live. Investigate bs_rbsp_trailing_bits() / how this RBSP's bit length is used downstream
+     * before trying this again. */
     bs_put_bit(bs, 0);
-    bs_rbsp_trailing_bits(bs);
 }
 
 static void build_pps_rbsp(bitstream_t *bs, const VAEncPictureParameterBufferH264 *pic) {
@@ -169,15 +204,24 @@ static void build_slice_header_bits(bitstream_t *bs,
                                      const VAEncSequenceParameterBufferH264 *seq,
                                      const VAEncPictureParameterBufferH264 *pic,
                                      const VAEncSliceParameterBufferH264 *slice) {
-    bs_start_code_and_nal_header(bs, 3, 5);
+    const int is_idr = pic->pic_fields.bits.idr_pic_flag;
+    /* IDR: nal_unit_type 5. P frame: nal_unit_type 1 and nal_ref_idc != 0 (the next frame references it). */
+    bs_start_code_and_nal_header(bs, is_idr ? 3 : 2, is_idr ? 5 : 1);
     bs_put_ue(bs, slice->macroblock_address);
     bs_put_ue(bs, slice->slice_type);
     bs_put_ue(bs, slice->pic_parameter_set_id);
     bs_put_bits(bs, pic->frame_num,
                 seq->seq_fields.bits.log2_max_frame_num_minus4 + 4);
-    bs_put_ue(bs, slice->idr_pic_id);
-    bs_put_bit(bs, 0);
-    bs_put_bit(bs, 0);
+    if (is_idr) {
+        bs_put_ue(bs, slice->idr_pic_id);
+        bs_put_bit(bs, 0);  /* no_output_of_prior_pics_flag */
+        bs_put_bit(bs, 0);  /* long_term_reference_flag */
+    } else {
+        bs_put_bit(bs, 0);  /* num_ref_idx_active_override_flag: the PPS default (1 reference) */
+        bs_put_bit(bs, 0);  /* ref_pic_list_modification_flag_l0 */
+        bs_put_bit(bs, 0);  /* adaptive_ref_pic_marking_mode_flag: sliding window */
+        if (pic->pic_fields.bits.entropy_coding_mode_flag) bs_put_ue(bs, 0);  /* cabac_init_idc */
+    }
     bs_put_se(bs, slice->slice_qp_delta);
     if (pic->pic_fields.bits.deblocking_filter_control_present_flag) {
         bs_put_ue(bs, slice->disable_deblocking_filter_idc);
@@ -227,6 +271,14 @@ typedef struct {
     VAContextID vpp_context_id;
     unsigned int width, height;
     int have_context;
+    /* Every frame of this encoder is an IDR, and the standard requires two consecutive IDR pictures to carry
+     * a different idr_pic_id (7.4.3): a counter, modulo its 16-bit range. Written as 0 in every frame it made
+     * recent ffmpeg warn "idr_pic_id is invalid" on each one (found with scrcpy, 10/2026). */
+    unsigned int idr_pic_id;
+    /* P frames (gop.h): the two reconstruction surfaces that the frames alternate between (the previous one is the
+     * reference of the next), and the state of the stream that holds the reference. */
+    VASurfaceID recon[2];
+    GopState gop;
     /* Tier 5.9: the real DRM format modifier a GPU-render-target RGBA
      * buffer ends up with is GPU-generation-specific (confirmed: differs
      * between a Renoir/GFX9 APU and a Polaris/GFX8 discrete card) and can't
@@ -423,9 +475,18 @@ static int vaapi_state_init(vaapi_state_t *st) {
     fprintf(stderr, "Using entrypoint %s\n",
             st->entrypoint == VAEntrypointEncSlice ? "VAEntrypointEncSlice" : "VAEntrypointEncSliceLP");
 
-    VAConfigAttrib attrib = {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420};
+    /* Constant QP on purpose: ratectl.h picks the QP of every frame, so the driver must not run its own
+     * rate control (asked for explicitly when the driver advertises it; otherwise CQP is the default). */
+    VAConfigAttrib attrib[2] = {{.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420},
+                                {.type = VAConfigAttribRateControl}};
+    int nattrib = 1;
+    vaGetConfigAttributes(st->dpy, VAProfileH264ConstrainedBaseline, st->entrypoint, &attrib[1], 1);
+    if (attrib[1].value != VA_ATTRIB_NOT_SUPPORTED && (attrib[1].value & VA_RC_CQP)) {
+        attrib[1].value = VA_RC_CQP;
+        nattrib = 2;
+    }
     CHECK_VA(vaCreateConfig(st->dpy, VAProfileH264ConstrainedBaseline, st->entrypoint,
-                             &attrib, 1, &st->config_id),
+                             attrib, nattrib, &st->config_id),
              "vaCreateConfig");
 
     /* VPP config for the RGBA->NV12 conversion stage (Tier 5.8). No RT
@@ -448,15 +509,16 @@ static int vaapi_state_ensure_resolution(vaapi_state_t *st, unsigned int width, 
     if (st->have_context) {
         vaDestroyContext(st->dpy, st->context_id);
         vaDestroyContext(st->dpy, st->vpp_context_id);
-        vaDestroySurfaces(st->dpy, &st->surfaces[1], 1);
+        vaDestroySurfaces(st->dpy, st->recon, 2);
         vaDestroySurfaces(st->dpy, &st->surfaces[2], 1);
         st->have_context = 0;
     }
+    gop_reset(&st->gop);  /* a new context has no reference */
     CHECK_VA(vaCreateSurfaces(st->dpy, VA_RT_FORMAT_YUV420, width, height,
-                               &st->surfaces[1], 1, NULL, 0),
+                               st->recon, 2, NULL, 0),
              "vaCreateSurfaces(recon)");
     CHECK_VA(vaCreateContext(st->dpy, st->config_id, width, height, VA_PROGRESSIVE,
-                              &st->surfaces[1], 1, &st->context_id),
+                              st->recon, 2, &st->context_id),
              "vaCreateContext");
 
     /* Tier 5.8: the NV12 surface VPP converts into and the encode context
@@ -491,6 +553,10 @@ static int convert_rgba_to_nv12(vaapi_state_t *st, VASurfaceID rgba_surface,
     pipeline_param.surface_region = &region;
     pipeline_param.output_region = &region;
     pipeline_param.surface_color_standard = VAProcColorStandardNone;
+    /* Reverted to BT601 (30/10/2026): neither this nor a BT709 + matching VUI attempt changed the
+     * washed-out picture reported live against cifi-nuevo-nuevo on jgustavo46 -- see
+     * build_sps_rbsp's comment. Colour matrix ruled out for now; isolating the GOP/P-frames
+     * angle next. */
     pipeline_param.output_color_standard = VAProcColorStandardBT601;
 
     VABufferID pipeline_buf;
@@ -507,65 +573,139 @@ static int convert_rgba_to_nv12(vaapi_state_t *st, VASurfaceID rgba_surface,
     return 0;
 }
 
+/* Normalizes ALL the Annex-B start codes of a bitstream to 4 bytes
+ * (00 00 00 01). It is needed because the Intel driver (iHD) emits 3-byte start codes
+ * (00 00 01) and radeonsi 4-byte ones: the CSD parser of MPEG4Writer (used by screenrecord
+ * and by the MP4 muxer of scrcpy) requires 4 bytes and aborts with
+ * "FORTIFY: write: count 18446744073709551615 > SSIZE_MAX" if it receives 3 --
+ * confirmed live on 05/10/2026 on an Iris Xe (n02), while the raw
+ * stream (--output-format=h264) decoded perfectly. It is safe to do it
+ * over the whole buffer: by the emulation-prevention rules, the sequence
+ * 00 00 01 cannot appear inside a NAL payload, so every
+ * occurrence is a start code. A 00 00 01 already preceded by 00 is left as
+ * it is (it is already 4 bytes, or it carries trailing_zero_8bits).
+ * Returns a new buffer (malloc) and frees `in`. */
+static unsigned char *normalize_start_codes(unsigned char *in, size_t n, size_t *out_n) {
+    size_t cap = n + n / 3 + 4;
+    unsigned char *out = malloc(cap);
+    if (!out) { *out_n = n; return in; }
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (i + 2 < n && in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 1
+            && (i == 0 || in[i - 1] != 0)) {
+            out[o++] = 0;
+        }
+        out[o++] = in[i];
+    }
+    free(in);
+    *out_n = o;
+    return out;
+}
+
 /* Imports the client's dma-buf as surfaces[0], runs the same encode
  * sequence tier2/tier3 already proved, and returns malloc'd Annex-B H.264
  * bytes (caller frees). Returns byte count, or -1 on error. */
-static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeRequest *req,
-                              unsigned char **out_buf) {
-    if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
+static RateCtl g_rate_ctl;  /* encode requests are served one at a time */
 
-    uint32_t import_stride = req->stride_y;
-    uint32_t import_size = req->dmabuf_size;
-    uint64_t import_modifier = st->rgba_modifier;
+static int64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 
-    /* Tier 5.12: GPUs where no DRM modifier exists for this buffer class at
-     * all (e.g. Polaris/GFX8's opaque TILE_TYPE_DRI, see rgba_modifier_init())
-     * use the OLD, pre-modifier VA-API import (VASurfaceAttribExternalBuffers
-     * / VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) directly on the real fd instead
-     * of DRM_PRIME_2 -- confirmed working, including cross-process, unlike
-     * the Tier 5.10 GL-bridge attempt this replaced (EGL's plain dma-buf
-     * import only resolves opaque tiling within the same process that
-     * allocated the buffer; VA-API's own import machinery doesn't share that
-     * limitation, likely because libva is built around cross-process IPC as
-     * the normal case to begin with, unlike EGL/GL). */
-    int use_legacy_prime_import = st->use_legacy_prime;
+/* REDROID_FORGE_ENCODE_BACKEND=ffmpeg (default: legacy, the hand-rolled bitstream writer below) --
+ * read once at startup in main(), before the first request. See ffmpeg_encode.h/.c: a libavcodec
+ * h264_vaapi encoder sharing the same RGBA->NV12 VPP step but replacing SPS/PPS/slice-header
+ * construction and the vaRenderPicture sequence entirely, to get past the Intel P-frame corruption
+ * below without having to keep bisecting the hand-rolled bitstream writer itself. */
+#ifdef HAVE_HWDEC
+static FFmpegEncState *g_ffmpeg_enc;
+#endif
+static int g_backend_is_ffmpeg;
 
-    /* Tier 5.7 finding: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (the old path
-     * used up through Tier 5.6) has no way to describe a DRM format
-     * modifier -- it always assumes the buffer is a plain linear raster.
-     * That held for every earlier tier's synthetic/dumb buffers (which
-     * genuinely were linear) but not for a real gralloc-allocated Surface
-     * buffer, which can be GPU-tiled even with DCC compression disabled
-     * (AMD_DEBUG=nodcc only affects compression, not tiling) -- importing a
-     * tiled buffer this way produced a garbled, striped decode. DRM_PRIME_2
-     * (VADRMPRIMESurfaceDescriptor) carries the modifier the component read
-     * out of cros_gralloc's native handle, so the driver interprets the
-     * memory layout correctly regardless of tiling.
-     *
-     * Tier 5.8 finding: the buffer itself is RGBA, not NV12 (Tier 5.7's
-     * closing discovery -- GraphicBufferSource hands the encoder
-     * SurfaceFlinger's raw GL-composited output, and this Mesa/minigbm
-     * stack cannot allocate a buffer that's both GPU-renderable and real
-     * YUV, see DEVLOG). VA_FOURCC_RGBA's byte order matches Android's
-     * RGBA_8888 directly (confirmed back in tier3-dmabuf-import); the DRM
-     * equivalent is DRM_FORMAT_ABGR8888, not DRM_FORMAT_RGBA8888 -- DRM
-     * format names describe *bit* packing in a little-endian 32-bit word,
-     * which inverts to the opposite letter order when read as bytes.
-     *
-     * Tier 5.9: the modifier comes from st->rgba_modifier (this host's own
-     * GPU, determined once at daemon startup), not from the client's
-     * request -- the Android-side component has no reliable way to read
-     * its real value at all (see DEVLOG), and the value is GPU-generation-
-     * specific besides, so asking this host's own driver directly is both
-     * the only correct source and the one that needs no Android rebuild to
-     * change machines. req->drm_format_modifier is intentionally ignored. */
+/* P frames (gop.h): off unless REDROID_FORGE_ENCODE_IDR_PERIOD > 1 (frames per IDR; 120 is about 2 s at 60 fps). Until it has been
+ * validated on every GPU the default stays the old all-intra encoder. REDROID_FORGE_ENCODE_INTRA_ONLY=1 forces it either way. */
+static unsigned int g_gop_period = 1;
+static int g_gop_intra_only = 1;
+static void gop_config_init(const vaapi_state_t *st) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *p = getenv("REDROID_FORGE_ENCODE_IDR_PERIOD");
+    if (p && atoi(p) > 1) g_gop_period = (unsigned int)atoi(p);
+    const char *io = getenv("REDROID_FORGE_ENCODE_INTRA_ONLY");
+    g_gop_intra_only = (g_gop_period <= 1) || (io && atoi(io) != 0);
+    g_rate_ctl.gop = !g_gop_intra_only;
+    /* The Intel driver (iHD) produces P frames that do not decode with the hand-written slice header (measured on an Iris Xe,
+     * entrypoint EncSlice: most P frames fail with "top block unavailable for requested intra mode"). Stay all-intra there
+     * unless REDROID_FORGE_ENCODE_P_ON_INTEL=1, to experiment -- this restriction is specific to the legacy backend's own
+     * bitstream writer, not to Intel/VA-API in general, so it does not apply when REDROID_FORGE_ENCODE_BACKEND=ffmpeg (the
+     * whole point of that backend is a mature encoder that gets P frames right on every vendor). */
+    const char *vendor = vaQueryVendorString(st->dpy);
+    if (!g_gop_intra_only && vendor && strstr(vendor, "Intel") && !g_backend_is_ffmpeg) {
+        const char *force = getenv("REDROID_FORGE_ENCODE_P_ON_INTEL");
+        if (!(force && atoi(force) != 0)) {
+            fprintf(stderr, "encoder: P frames are not supported on the Intel driver (%s): staying all-intra\n", vendor);
+            g_gop_intra_only = 1;
+            g_rate_ctl.gop = 0;
+        }
+    }
+    if (!g_gop_intra_only) fprintf(stderr, "encoder: P frames, an IDR every %u frames\n", g_gop_period);
+}
+
+/* Imports the client's dma-buf as st->surfaces[0] (RGBA) -- shared between the legacy and ffmpeg
+ * encode backends (see ffmpeg_encode.h), since this step and the RGBA->NV12 VPP conversion that
+ * follows (convert_rgba_to_nv12) are identical either way; only what happens AFTER st->surfaces[2]
+ * (NV12) is ready differs by backend.
+ *
+ * Tier 5.12: GPUs where no DRM modifier exists for this buffer class at
+ * all (e.g. Polaris/GFX8's opaque TILE_TYPE_DRI, see rgba_modifier_init())
+ * use the OLD, pre-modifier VA-API import (VASurfaceAttribExternalBuffers
+ * / VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) directly on the real fd instead
+ * of DRM_PRIME_2 -- confirmed working, including cross-process, unlike
+ * the Tier 5.10 GL-bridge attempt this replaced (EGL's plain dma-buf
+ * import only resolves opaque tiling within the same process that
+ * allocated the buffer; VA-API's own import machinery doesn't share that
+ * limitation, likely because libva is built around cross-process IPC as
+ * the normal case to begin with, unlike EGL/GL).
+ *
+ * Tier 5.7 finding: VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (the old path
+ * used up through Tier 5.6) has no way to describe a DRM format
+ * modifier -- it always assumes the buffer is a plain linear raster.
+ * That held for every earlier tier's synthetic/dumb buffers (which
+ * genuinely were linear) but not for a real gralloc-allocated Surface
+ * buffer, which can be GPU-tiled even with DCC compression disabled
+ * (AMD_DEBUG=nodcc only affects compression, not tiling) -- importing a
+ * tiled buffer this way produced a garbled, striped decode. DRM_PRIME_2
+ * (VADRMPRIMESurfaceDescriptor) carries the modifier the component read
+ * out of cros_gralloc's native handle, so the driver interprets the
+ * memory layout correctly regardless of tiling.
+ *
+ * Tier 5.8 finding: the buffer itself is RGBA, not NV12 (Tier 5.7's
+ * closing discovery -- GraphicBufferSource hands the encoder
+ * SurfaceFlinger's raw GL-composited output, and this Mesa/minigbm
+ * stack cannot allocate a buffer that's both GPU-renderable and real
+ * YUV, see DEVLOG). VA_FOURCC_RGBA's byte order matches Android's
+ * RGBA_8888 directly (confirmed back in tier3-dmabuf-import); the DRM
+ * equivalent is DRM_FORMAT_ABGR8888, not DRM_FORMAT_RGBA8888 -- DRM
+ * format names describe *bit* packing in a little-endian 32-bit word,
+ * which inverts to the opposite letter order when read as bytes.
+ *
+ * Tier 5.9: the modifier comes from st->rgba_modifier (this host's own
+ * GPU, determined once at daemon startup), not from the client's
+ * request -- the Android-side component has no reliable way to read
+ * its real value at all (see DEVLOG), and the value is GPU-generation-
+ * specific besides, so asking this host's own driver directly is both
+ * the only correct source and the one that needs no Android rebuild to
+ * change machines. req->drm_format_modifier is intentionally ignored. */
+static int import_dmabuf_as_surface0(vaapi_state_t *st, int dmabuf_fd, const EncodeRequest *req) {
     VADRMPRIMESurfaceDescriptor prime_desc = {0};
     VASurfaceAttribExternalBuffers legacy_ext_buf = {0};
     uintptr_t legacy_buffer_handles[1];
     VASurfaceAttrib import_attribs[2];
     VAStatus st_import;
 
-    if (use_legacy_prime_import) {
+    if (st->use_legacy_prime) {
         legacy_buffer_handles[0] = (uintptr_t)dmabuf_fd;
         legacy_ext_buf.pixel_format = VA_FOURCC_RGBA;
         legacy_ext_buf.width = req->width;
@@ -594,14 +734,14 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
         prime_desc.height = req->height;
         prime_desc.num_objects = 1;
         prime_desc.objects[0].fd = dmabuf_fd;
-        prime_desc.objects[0].size = import_size;
-        prime_desc.objects[0].drm_format_modifier = import_modifier;
+        prime_desc.objects[0].size = req->dmabuf_size;
+        prime_desc.objects[0].drm_format_modifier = st->rgba_modifier;
         prime_desc.num_layers = 1;
         prime_desc.layers[0].drm_format = DRM_FORMAT_ABGR8888;
         prime_desc.layers[0].num_planes = 1;
         prime_desc.layers[0].object_index[0] = 0;
         prime_desc.layers[0].offset[0] = 0;
-        prime_desc.layers[0].pitch[0] = import_stride;
+        prime_desc.layers[0].pitch[0] = req->stride_y;
 
         import_attribs[0].type = VASurfaceAttribMemoryType;
         import_attribs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
@@ -619,6 +759,18 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
         fprintf(stderr, "dma-buf import failed: %s\n", vaErrorStr(st_import));
         return -1;
     }
+    return 0;
+}
+
+static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeRequest *req, pid_t peer_pid,
+                              unsigned char **out_buf) {
+    if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
+    gop_config_init(st);
+    const int64_t gop_now = now_ns();
+    const GopDecision gd = gop_next(&st->gop, peer_pid, req->width, req->height, gop_now, g_gop_period, g_gop_intra_only);
+    const int qp = rc_next_qp_t(&g_rate_ctl, now_ns(), req->bitrate, req->width, req->height, gd.is_idr);
+
+    if (import_dmabuf_as_surface0(st, dmabuf_fd, req) != 0) return -1;
 
     if (convert_rgba_to_nv12(st, st->surfaces[0], req->width, req->height) != 0) {
         vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
@@ -636,10 +788,10 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     VAEncSequenceParameterBufferH264 seq = {0};
     seq.seq_parameter_set_id = 0;
     seq.level_idc = 30;
-    seq.intra_period = 1;
-    seq.intra_idr_period = 1;
-    seq.ip_period = 0;
-    seq.bits_per_second = 2000000;
+    seq.intra_period = g_gop_intra_only ? 1 : g_gop_period;
+    seq.intra_idr_period = g_gop_intra_only ? 1 : g_gop_period;
+    seq.ip_period = g_gop_intra_only ? 0 : 1;
+    seq.bits_per_second = req->bitrate ? req->bitrate : 2000000;
     seq.max_num_ref_frames = 1;
     seq.picture_width_in_mbs = mb_width;
     seq.picture_height_in_mbs = mb_height;
@@ -655,14 +807,25 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     vaCreateBuffer(st->dpy, st->context_id, VAEncSequenceParameterBufferType, sizeof(seq), 1, &seq, &seq_buf);
 
     VAEncPictureParameterBufferH264 pic = {0};
-    pic.CurrPic.picture_id = st->surfaces[1];
+    pic.CurrPic.picture_id = st->recon[gd.cur];
+    pic.CurrPic.frame_idx = gd.frame_num;
+    pic.CurrPic.TopFieldOrderCnt = (int32_t)gd.poc;
+    pic.CurrPic.BottomFieldOrderCnt = (int32_t)gd.poc;
+    pic.frame_num = (uint16_t)gd.frame_num;
     for (int i = 0; i < 16; i++) {
         pic.ReferenceFrames[i].picture_id = VA_INVALID_ID;
         pic.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
     }
+    if (!gd.is_idr) {
+        pic.ReferenceFrames[0].picture_id = st->recon[gd.ref];
+        pic.ReferenceFrames[0].frame_idx = gd.ref_frame_num;
+        pic.ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+        pic.ReferenceFrames[0].TopFieldOrderCnt = (int32_t)gd.ref_poc;
+        pic.ReferenceFrames[0].BottomFieldOrderCnt = (int32_t)gd.ref_poc;
+    }
     pic.coded_buf = coded_buf;
-    pic.pic_init_qp = 26;
-    pic.pic_fields.bits.idr_pic_flag = 1;
+    pic.pic_init_qp = qp;
+    pic.pic_fields.bits.idr_pic_flag = gd.is_idr;
     pic.pic_fields.bits.reference_pic_flag = 1;
     pic.pic_fields.bits.entropy_coding_mode_flag = 1;
     pic.pic_fields.bits.deblocking_filter_control_present_flag = 1;
@@ -673,7 +836,8 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     VAEncSliceParameterBufferH264 slice = {0};
     slice.num_macroblocks = mb_width * mb_height;
     slice.macroblock_info = VA_INVALID_ID;
-    slice.slice_type = 2;
+    slice.slice_type = gd.is_idr ? 2 : 0;
+    if (gd.is_idr) slice.idr_pic_id = st->idr_pic_id++ & 0xFFFF;
     slice.direct_spatial_mv_pred_flag = 1;
     slice.num_ref_idx_active_override_flag = 1;
     for (int i = 0; i < 32; i++) {
@@ -681,6 +845,10 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
         slice.RefPicList0[i].flags = VA_PICTURE_H264_INVALID;
         slice.RefPicList1[i].picture_id = VA_INVALID_ID;
         slice.RefPicList1[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    if (!gd.is_idr) {
+        slice.num_ref_idx_l0_active_minus1 = 0;
+        slice.RefPicList0[0] = pic.ReferenceFrames[0];
     }
 
     VABufferID slice_buf;
@@ -690,25 +858,33 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     bs_init(&sps_bs);
     bs_init(&pps_bs);
     bs_init(&slice_hdr_bs);
-    build_sps_rbsp(&sps_bs, &seq);
-    build_pps_rbsp(&pps_bs, &pic);
+    if (gd.is_idr) {
+        build_sps_rbsp(&sps_bs, &seq);
+        build_pps_rbsp(&pps_bs, &pic);
+    }
     build_slice_header_bits(&slice_hdr_bs, &seq, &pic, &slice);
 
     VABufferID sps_param_buf, sps_data_buf, pps_param_buf, pps_data_buf;
     VABufferID slice_hdr_param_buf, slice_hdr_data_buf;
-    submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSequence, &sps_bs, &sps_param_buf, &sps_data_buf);
-    submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderPicture, &pps_bs, &pps_param_buf, &pps_data_buf);
+    if (gd.is_idr) {
+        submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSequence, &sps_bs, &sps_param_buf, &sps_data_buf);
+        submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderPicture, &pps_bs, &pps_param_buf, &pps_data_buf);
+    }
     submit_packed_header(st->dpy, st->context_id, VAEncPackedHeaderSlice, &slice_hdr_bs, &slice_hdr_param_buf, &slice_hdr_data_buf);
 
     CHECK_VA(vaBeginPicture(st->dpy, st->context_id, st->surfaces[2]), "vaBeginPicture");
     VABufferID b1[] = {seq_buf};
     vaRenderPicture(st->dpy, st->context_id, b1, 1);
-    VABufferID b2[] = {sps_param_buf, sps_data_buf};
-    vaRenderPicture(st->dpy, st->context_id, b2, 2);
+    if (gd.is_idr) {
+        VABufferID b2[] = {sps_param_buf, sps_data_buf};
+        vaRenderPicture(st->dpy, st->context_id, b2, 2);
+    }
     VABufferID b3[] = {pic_buf};
     vaRenderPicture(st->dpy, st->context_id, b3, 1);
-    VABufferID b4[] = {pps_param_buf, pps_data_buf};
-    vaRenderPicture(st->dpy, st->context_id, b4, 2);
+    if (gd.is_idr) {
+        VABufferID b4[] = {pps_param_buf, pps_data_buf};
+        vaRenderPicture(st->dpy, st->context_id, b4, 2);
+    }
     VABufferID b5[] = {slice_hdr_param_buf, slice_hdr_data_buf};
     vaRenderPicture(st->dpy, st->context_id, b5, 2);
     VABufferID b6[] = {slice_buf};
@@ -734,9 +910,73 @@ static long encode_one_frame(vaapi_state_t *st, int dmabuf_fd, const EncodeReque
     vaDestroyBuffer(st->dpy, coded_buf);
     vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
 
+    out = normalize_start_codes(out, total, &total);
+    rc_frame_done_t(&g_rate_ctl, now_ns(), total, qp, gd.is_idr);
+    gop_commit(&st->gop, &gd, peer_pid, req->width, req->height, gop_now);
+    if (getenv("REDROID_FORGE_ENCODE_STATS")) {
+        static int64_t t0; static uint64_t frames, bytes;
+        int64_t t = now_ns();
+        if (!t0 || t - t0 > 5000000000LL) {
+            if (t0 && frames) fprintf(stderr, "encode-stats: %.2f Mbps over %.1f s (%llu frames, target %.2f Mbps, last qp %d)\n",
+                                      bytes * 8.0 / ((t - t0) / 1e9) / 1e6, (t - t0) / 1e9, (unsigned long long)frames,
+                                      req->bitrate / 1e6, qp);
+            t0 = t; frames = 0; bytes = 0;
+        }
+        frames++; bytes += total;
+    }
+    if (getenv("REDROID_FORGE_ENCODE_STATS")) {
+        static int64_t g0; static uint64_t gi, gp, gib, gpb;
+        int64_t t = now_ns();
+        if (!g0 || t - g0 > 5000000000LL) {
+            if (g0 && (gi + gp)) fprintf(stderr, "gop-stats: %llu IDR (%.0f KB avg), %llu P (%.0f KB avg) in %.1f s\n",
+                                         (unsigned long long)gi, gi ? gib / 1024.0 / gi : 0.0, (unsigned long long)gp,
+                                         gp ? gpb / 1024.0 / gp : 0.0, (t - g0) / 1e9);
+            g0 = t; gi = gp = gib = gpb = 0;
+        }
+        if (gd.is_idr) { gi++; gib += total; } else { gp++; gpb += total; }
+    }
     *out_buf = out;
     return (long)total;
 }
+
+#ifdef HAVE_HWDEC
+/* REDROID_FORGE_ENCODE_BACKEND=ffmpeg: same dma-buf import + RGBA->NV12 VPP step as
+ * encode_one_frame() above (import_dmabuf_as_surface0/convert_rgba_to_nv12, untouched), same
+ * gop_next()/gop_commit() IDR policy (gop.h has no VA-API dependency) -- only the actual encode
+ * is different: ffmpeg_encode_frame() hands st->surfaces[2] to libavcodec's h264_vaapi encoder
+ * instead of the hand-rolled SPS/PPS/slice-header + vaRenderPicture sequence. No per-frame qp /
+ * rc_next_qp_t / req->bitrate here -- ffmpeg_encode.c forces a fixed CQP (see its own comment on
+ * why: this is what every VA-API driver tested so far actually supports for this entrypoint, same
+ * reasoning ratectl.h already gives for the legacy backend). REDROID_FORGE_ENCODE_STATS
+ * is not mirrored for this backend yet either (both are known, deliberate gaps for this first cut,
+ * not oversights -- see the plan this was built from). */
+static long encode_one_frame_ffmpeg(vaapi_state_t *st, int dmabuf_fd, const EncodeRequest *req, pid_t peer_pid,
+                                     unsigned char **out_buf) {
+    if (vaapi_state_ensure_resolution(st, req->width, req->height) != 0) return -1;
+    gop_config_init(st);
+    const int64_t gop_now = now_ns();
+    const GopDecision gd = gop_next(&st->gop, peer_pid, req->width, req->height, gop_now, g_gop_period, g_gop_intra_only);
+
+    if (import_dmabuf_as_surface0(st, dmabuf_fd, req) != 0) return -1;
+
+    if (convert_rgba_to_nv12(st, st->surfaces[0], req->width, req->height) != 0) {
+        vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
+        return -1;
+    }
+
+    unsigned char *out = NULL;
+    long n = ffmpeg_encode_frame(g_ffmpeg_enc, st->dpy, st->surfaces[2], req->width, req->height,
+                                  gd.is_idr, &out);
+    vaDestroySurfaces(st->dpy, &st->surfaces[0], 1);
+    if (n < 0) return -1;
+
+    size_t total = (size_t)n;
+    out = normalize_start_codes(out, total, &total);
+    gop_commit(&st->gop, &gd, peer_pid, req->width, req->height, gop_now);
+    *out_buf = out;
+    return (long)total;
+}
+#endif
 
 /* ------------------------------------------------------------------ *
  * Socket server: one connection = one request/response, per protocol.h.
@@ -753,8 +993,9 @@ static int recv_request(int conn_fd, EncodeRequest *req, int *out_dmabuf_fd) {
     msg.msg_control = cmsg_buf;
     msg.msg_controllen = sizeof(cmsg_buf);
 
+    memset(req, 0, sizeof(*req));  /* fields an older client does not send stay 0 */
     ssize_t n = recvmsg(conn_fd, &msg, 0);
-    if (n != (ssize_t)sizeof(*req)) {
+    if (n != (ssize_t)sizeof(*req) && n != ENCODE_REQUEST_V1_SIZE) {
         if (n < 0) perror("recvmsg");
         else fprintf(stderr, "recvmsg: short read (%zd of %zu bytes)\n", n, sizeof(*req));
         return -1;
@@ -797,11 +1038,21 @@ static void handle_encode(vaapi_state_t *st, int have_encode, int conn_fd) {
     fprintf(stderr, "Request: %ux%u, stride_y=%u stride_uv=%u offset_uv=%u dmabuf_size=%u fd=%d\n",
             req.width, req.height, req.stride_y, req.stride_uv, req.offset_uv, req.dmabuf_size, dmabuf_fd);
 
+    struct ucred cred = {0};
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) cred.pid = 0;
+
     unsigned char *out_buf = NULL;
-    long n = encode_one_frame(st, dmabuf_fd, &req, &out_buf);
+    long n;
+#ifdef HAVE_HWDEC
+    if (g_backend_is_ffmpeg) n = encode_one_frame_ffmpeg(st, dmabuf_fd, &req, cred.pid, &out_buf);
+    else
+#endif
+        n = encode_one_frame(st, dmabuf_fd, &req, cred.pid, &out_buf);
     close(dmabuf_fd);
 
     if (n < 0) {
+        gop_reset(&st->gop);  /* the reference may be lost: the next frame is an IDR */
         send_response(conn_fd, -1, NULL, 0);
     } else {
         fprintf(stderr, "Encoded %ld bytes\n", n);
@@ -885,13 +1136,362 @@ static void handle_decode(int have_decode, int conn_fd) {
     send_decode_response(conn_fd, 0, out_data, (uint32_t)out_size);
 }
 
-static void handle_connection(vaapi_state_t *st, int have_encode, int have_decode, int conn_fd) {
+#ifdef HAVE_HWDEC
+/* ------------------------------------------------------------------ *
+ * hwdec (protocol v2, see protocol.h): stateful hardware decode.
+ * One persistent connection = one session = one thread. The encode and the NVIDIA decode
+ * above are still served serially on the main thread.
+ * ------------------------------------------------------------------ */
+_Static_assert((int)HWDEC_H264 == (int)VAAPI_HWDEC_CODEC_H264 && (int)HWDEC_HEVC == (int)VAAPI_HWDEC_CODEC_HEVC &&
+               (int)HWDEC_VP9 == (int)VAAPI_HWDEC_CODEC_VP9 && (int)HWDEC_VP8 == (int)VAAPI_HWDEC_CODEC_VP8 &&
+               (int)HWDEC_MPEG2 == (int)VAAPI_HWDEC_CODEC_MPEG2 && (int)HWDEC_VC1 == (int)VAAPI_HWDEC_CODEC_VC1 &&
+               (int)HWDEC_AV1 == (int)VAAPI_HWDEC_CODEC_AV1 && (int)HWDEC_NCODECS == (int)VAAPI_HWDEC_CODEC_COUNT,
+               "the codec ids of protocol.h and hwdec.h have to match");
+_Static_assert(sizeof(HwDecRequest) == 16 && sizeof(HwDecFrameHeader) == 24 &&
+               sizeof(HwDecResponse) == 8 && sizeof(HwDecCapsResponse) == 176,
+               "unexpected protocol.h layout (Android and the daemon must match)");
+
+#define HWDEC_MAX_AU_SIZE (32u * 1024 * 1024)
+
+static const char *hwdec_node(void) {
+    const char *n = getenv("REDROID_FORGE_DRM_NODE");
+    return (n && *n) ? n : "/dev/dri/renderD128";
+}
+
+static int io_read_all(int fd, void *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, (char *)buf + got, len - got);
+        if (n == 0) return 0;               /* the client closed */
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        got += (size_t)n;
+    }
+    return 1;
+}
+
+static uint64_t mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static int io_write_all(int fd, const void *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, (const char *)buf + sent, len - sent);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+/* Frames pending to be sent: [HwDecFrameHeader][bytes] repeated. */
+typedef struct {
+    unsigned char *buf;
+    size_t len, cap;
+    uint32_t nframes;
+} FrameQueue;
+
+static int fq_append(FrameQueue *q, const HwDecFrame *f) {
+    size_t need = q->len + sizeof(HwDecFrameHeader) + f->size;
+    if (need > q->cap) {
+        size_t cap = q->cap ? q->cap : 1u << 20;
+        while (cap < need) cap *= 2;
+        unsigned char *nb = realloc(q->buf, cap);
+        if (!nb) return -1;
+        q->buf = nb;
+        q->cap = cap;
+    }
+    HwDecFrameHeader h = {.width = f->width, .height = f->height, .is_10bit = (uint32_t)f->is_10bit,
+                          .size = (uint32_t)f->size, .pts = f->pts};
+    memcpy(q->buf + q->len, &h, sizeof(h));
+    memcpy(q->buf + q->len + sizeof(h), f->data, f->size);
+    q->len = need;
+    q->nframes++;
+    return 0;
+}
+
+/* Drains whatever the decoder has ready. Returns 0, or <0 if there was a real error. */
+static __thread uint64_t tl_ns_queue;  /* time in fq_append of the current thread (REDROID_FORGE_HWDEC_STATS) */
+
+/* Shared memory (memfd) of the hwdec session, if the client asked for it: the frames are written there directly. */
+typedef struct {
+    uint8_t *base;
+    size_t cap, off;
+} ShmWin;
+static __thread ShmWin *tl_shm;
+
+static size_t shm_align(size_t n) {
+    return (n + VAAPI_HWDEC_SHM_ALIGN - 1) / VAAPI_HWDEC_SHM_ALIGN * VAAPI_HWDEC_SHM_ALIGN;
+}
+
+static int fq_append_hdr(FrameQueue *q, const HwDecFrame *f) {
+    size_t need = q->len + sizeof(HwDecFrameHeader);
+    if (need > q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 4096;
+        unsigned char *nb = realloc(q->buf, cap);
+        if (!nb) return -1;
+        q->buf = nb;
+        q->cap = cap;
+    }
+    HwDecFrameHeader h = {.width = f->width, .height = f->height, .is_10bit = (uint32_t)f->is_10bit,
+                          .size = (uint32_t)f->size, .pts = f->pts};
+    memcpy(q->buf + q->len, &h, sizeof(h));
+    q->len = need;
+    q->nframes++;
+    return 0;
+}
+
+static int hwdec_drain(HwDecSession *s, FrameQueue *q) {
+    HwDecFrame f;
+    for (;;) {
+        int r;
+        if (tl_shm) {
+            /* Shared memory mode: the frame is downloaded straight into place; only the header stays in the queue. */
+            r = hwdec_receive_to(s, &f, tl_shm->base + tl_shm->off, tl_shm->cap - tl_shm->off);
+            if (r == HWDEC_AGAIN || r == HWDEC_EOF) return 0;
+            if (r < 0) return r;
+            tl_shm->off += shm_align(f.size);
+            if (fq_append_hdr(q, &f) != 0) return -1;
+            continue;
+        }
+        r = hwdec_receive(s, &f);
+        if (r == HWDEC_AGAIN || r == HWDEC_EOF) return 0;
+        if (r < 0) return r;
+        const uint64_t t0 = mono_ns();
+        int ar = fq_append(q, &f);
+        tl_ns_queue += mono_ns() - t0;
+        if (ar != 0) return -1;
+    }
+}
+
+/* Open response with the shared memory fd attached (SCM_RIGHTS). */
+static int send_open_resp_fd(int sock, const HwDecOpenResponse *resp, int fd) {
+    struct iovec iov = {.iov_base = (void *)resp, .iov_len = sizeof(*resp)};
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } u;
+    memset(&u, 0, sizeof(u));
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.buf, .msg_controllen = sizeof(u.buf)};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    ssize_t n;
+    do { n = sendmsg(sock, &msg, MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
+    return n == (ssize_t)sizeof(*resp) ? 0 : -1;
+}
+
+#define HWDEC_SHM_MIB 512u  /* virtual memory: only what the frames write is touched (and takes up RAM) */
+
+static void *hwdec_stream_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    HwDecOpenRequest open_req;
+    HwDecOpenResponse open_resp = {0};
+    HwDecSession *s = NULL;
+    unsigned char *au = NULL;
+    size_t au_cap = 0;
+    /* Stream configuration (VAAPI_HWDEC_MSG_CONFIG): pending to be prepended to the next AU, and the last
+     * known one to repeat it after a decoder restart. */
+    unsigned char *cfg = NULL, *last_cfg = NULL, *joined = NULL;
+    size_t cfg_len = 0, last_cfg_len = 0, joined_cap = 0;
+    int need_replay = 1;
+    ShmWin shm = {0};
+    int memfd = -1;
+    tl_shm = NULL;
+    const int stats = getenv("REDROID_FORGE_HWDEC_STATS") != NULL;
+    uint64_t ns_wait = 0, ns_write = 0, nresp = 0;
+    tl_ns_queue = 0;
+
+    if (io_read_all(fd, &open_req, sizeof(open_req)) != 1) goto done;
+    if (open_req.codec < HWDEC_NCODECS) s = hwdec_open(hwdec_node(), (HwDecCodec)open_req.codec);
+    if (!s) {
+        open_resp.status = -1;
+        io_write_all(fd, &open_resp, sizeof(open_resp));
+        goto done;
+    }
+    if (open_req.flags & VAAPI_HWDEC_OPEN_SHM) {
+        /* The client can use shared memory: memfd + mmap, and the fd travels with the response. If something fails
+         * it goes on with inline frames (the client knows by shm_mib == 0). */
+        const size_t cap = (size_t)HWDEC_SHM_MIB << 20;
+        memfd = (int)syscall(SYS_memfd_create, "redroid-forge-hwdec", 1u /* MFD_CLOEXEC */);
+        if (memfd >= 0 && ftruncate(memfd, (off_t)cap) == 0) {
+            void *m = mmap(NULL, cap, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+            if (m != MAP_FAILED) {
+                shm.base = m;
+                shm.cap = cap;
+                open_resp.shm_mib = HWDEC_SHM_MIB;
+            }
+        }
+        if (!shm.base && memfd >= 0) { close(memfd); memfd = -1; }
+    }
+    if (shm.base) {
+        if (send_open_resp_fd(fd, &open_resp, memfd) != 0) goto done;
+        tl_shm = &shm;
+    } else if (io_write_all(fd, &open_resp, sizeof(open_resp)) != 0) {
+        goto done;
+    }
+    fprintf(stderr, "hwdec: session open (%s%s)\n", hwdec_codec_name((HwDecCodec)open_req.codec),
+            shm.base ? ", shared memory" : "");
+
+    for (;;) {
+        HwDecRequest rq;
+        const uint64_t tw0 = stats ? mono_ns() : 0;
+        if (io_read_all(fd, &rq, sizeof(rq)) != 1) break;   /* the connection closed: the session is closed */
+        if (stats) ns_wait += mono_ns() - tw0;
+        FrameQueue q = {0};
+        int status = 0, stop = 0;
+        shm.off = 0;  /* the client has already copied the frames of the previous response */
+
+        switch (rq.msg) {
+        case VAAPI_HWDEC_MSG_AU: {
+            if (rq.size == 0 || rq.size > HWDEC_MAX_AU_SIZE) { status = -2; stop = 1; break; }
+            if (rq.size > au_cap) {
+                unsigned char *nb = realloc(au, rq.size);
+                if (!nb) { status = -3; stop = 1; break; }
+                au = nb;
+                au_cap = rq.size;
+            }
+            if (io_read_all(fd, au, rq.size) != 1) { stop = 1; status = -4; break; }
+            /* Diagnostics (REDROID_FORGE_HWDEC_DEBUG=1): first bytes of every access unit that arrives. It is used
+             * to see in what format Android delivers it (Annex-B with 00 00 00 01, or with a length prefix). */
+            if (getenv("REDROID_FORGE_HWDEC_DEBUG")) {
+                char hex[3 * 24 + 1] = {0};
+                for (uint32_t i = 0; i < rq.size && i < 24; i++) snprintf(hex + 3 * i, 4, "%02x ", au[i]);
+                fprintf(stderr, "hwdec: AU pts=%lld size=%u: %s\n", (long long)rq.pts, rq.size, hex);
+            }
+            /* Prepends the pending configuration (SPS/PPS), or the last known one if the decoder restarted. */
+            const unsigned char *send_buf = au;
+            size_t send_len = rq.size;
+            const unsigned char *pre = cfg_len ? cfg : (need_replay ? last_cfg : NULL);
+            size_t pre_len = cfg_len ? cfg_len : (need_replay ? last_cfg_len : 0);
+            if (pre && pre_len) {
+                if (pre_len + rq.size > joined_cap) {
+                    unsigned char *nb = realloc(joined, pre_len + rq.size);
+                    if (!nb) { status = -3; stop = 1; break; }
+                    joined = nb;
+                    joined_cap = pre_len + rq.size;
+                }
+                memcpy(joined, pre, pre_len);
+                memcpy(joined + pre_len, au, rq.size);
+                send_buf = joined;
+                send_len = pre_len + rq.size;
+            }
+            cfg_len = 0;
+            need_replay = 0;
+            int r;
+            while ((r = hwdec_send(s, send_buf, send_len, rq.pts)) == HWDEC_AGAIN) {
+                if ((status = hwdec_drain(s, &q)) < 0) break;
+            }
+            if (status == 0 && r < 0) status = r;
+            if (status == 0) status = hwdec_drain(s, &q);
+            break;
+        }
+        case VAAPI_HWDEC_MSG_CONFIG: {
+            if (rq.size == 0 || rq.size > HWDEC_MAX_AU_SIZE) { status = -2; stop = 1; break; }
+            /* Android delivers the parameters in SEVERAL configuration buffers (H.264: first the SPS and
+             * then the PPS; HEVC: VPS, SPS, PPS). As long as no access unit has consumed them they are
+             * ACCUMULATED; the first CONFIG after an AU starts a new set. */
+            /* Only H.264 and HEVC carry the configuration INSIDE the bitstream (SPS/PPS/VPS in Annex-B) and need it
+             * prepended. In VP8/VP9/AV1 Android's "CSD" is the container's CodecPrivate (for VP9
+             * it starts with 0x01, not with the 0x49 sync marker): prepending it makes the frame invalid. */
+            if (open_req.codec != VAAPI_HWDEC_CODEC_H264 && open_req.codec != VAAPI_HWDEC_CODEC_HEVC) {
+                unsigned char *skip = malloc(rq.size);
+                if (!skip) { status = -3; stop = 1; break; }
+                int rd = io_read_all(fd, skip, rq.size);
+                free(skip);
+                if (rd != 1) { stop = 1; status = -4; }
+                break;
+            }
+            size_t total = cfg_len + rq.size;
+            unsigned char *nb = realloc(cfg, total);
+            if (!nb) { status = -3; stop = 1; break; }
+            cfg = nb;
+            if (io_read_all(fd, cfg + cfg_len, rq.size) != 1) { stop = 1; status = -4; break; }
+            cfg_len = total;
+            unsigned char *nl = realloc(last_cfg, total);
+            if (!nl) { status = -3; stop = 1; break; }
+            last_cfg = nl;
+            memcpy(last_cfg, cfg, total);
+            last_cfg_len = total;
+            break;
+        }
+        case VAAPI_HWDEC_MSG_FLUSH:
+            hwdec_flush(s);
+            need_replay = 1;
+            break;
+        case VAAPI_HWDEC_MSG_EOS:
+            status = hwdec_send_eos(s);
+            if (status == 0) status = hwdec_drain(s, &q);
+            /* After draining, libavcodec is left in the EOF state and rejects more input. Android's
+             * component also asks to drain mid-stream (drain without EOS, e.g. on a change of
+             * resolution), so the decoder is restarted to be able to keep decoding. */
+            hwdec_flush(s);
+            need_replay = 1;
+            break;
+        case VAAPI_HWDEC_MSG_CLOSE:
+            stop = 1;
+            break;
+        default:
+            status = -5;
+            stop = 1;
+            break;
+        }
+
+        HwDecResponse resp = {.status = status, .nframes = q.nframes};
+        const uint64_t ts0 = stats ? mono_ns() : 0;
+        int werr = io_write_all(fd, &resp, sizeof(resp));
+        if (!werr && q.len) werr = io_write_all(fd, q.buf, q.len);
+        if (stats) { ns_write += mono_ns() - ts0; nresp++; }
+        free(q.buf);
+        if (werr || stop) break;
+    }
+done:
+    tl_shm = NULL;
+    if (shm.base) munmap(shm.base, shm.cap);
+    if (memfd >= 0) close(memfd);
+    if (stats && nresp) {
+        fprintf(stderr,
+                "hwdec-stats[daemon]: %llu responses | per response (ms): android_wait=%.2f queue_build=%.2f "
+                "socket_write=%.2f\n",
+                (unsigned long long)nresp, (double)ns_wait / nresp / 1e6, (double)tl_ns_queue / nresp / 1e6,
+                (double)ns_write / nresp / 1e6);
+    }
+    free(au);
+    free(cfg);
+    free(last_cfg);
+    free(joined);
+    hwdec_close(s);
+    close(fd);
+    return NULL;
+}
+
+static void handle_hwdec_caps(int conn_fd) {
+    HwDecCapsResponse resp = {0};
+    HwDecCaps caps;
+    if (hwdec_probe(hwdec_node(), &caps) != 0) {
+        resp.status = -1;
+    } else {
+        for (int i = 0; i < HWDEC_NCODECS; i++) {
+            if (caps.supported[i]) resp.supported_mask |= 1u << i;
+            if (caps.supported_10bit[i]) resp.supported_10bit_mask |= 1u << i;
+        }
+        snprintf(resp.driver, sizeof(resp.driver), "%s", caps.driver);
+    }
+    io_write_all(conn_fd, &resp, sizeof(resp));
+}
+#endif /* HAVE_HWDEC */
+
+/* Returns 1 if the connection moves to another thread (which closes it), 0 if it has to be closed here. */
+static int handle_connection(vaapi_state_t *st, int have_encode, int have_decode, int conn_fd) {
     VaapiCommand cmd;
     ssize_t n = read(conn_fd, &cmd, sizeof(cmd));
     if (n != (ssize_t)sizeof(cmd)) {
         if (n < 0) perror("read(command tag)");
         else fprintf(stderr, "read(command tag): short read (%zd of %zu bytes)\n", n, sizeof(cmd));
-        return;
+        return 0;
     }
     switch (cmd) {
     case VAAPI_CMD_ENCODE:
@@ -900,10 +1500,30 @@ static void handle_connection(vaapi_state_t *st, int have_encode, int have_decod
     case VAAPI_CMD_DECODE:
         handle_decode(have_decode, conn_fd);
         break;
+#ifdef HAVE_HWDEC
+    case VAAPI_CMD_HWDEC: {
+        pthread_t t;
+        if (pthread_create(&t, NULL, hwdec_stream_thread, (void *)(intptr_t)conn_fd) != 0) {
+            perror("pthread_create(hwdec)");
+            return 0;
+        }
+        pthread_detach(t);
+        return 1;
+    }
+    case VAAPI_CMD_HWDEC_CAPS:
+        handle_hwdec_caps(conn_fd);
+        break;
+#else
+    case VAAPI_CMD_HWDEC:
+    case VAAPI_CMD_HWDEC_CAPS:
+        fprintf(stderr, "hwdec requested, but this daemon was compiled without HAVE_HWDEC\n");
+        break; /* the connection is closed: the client sees it as a clean rejection */
+#endif
     default:
         fprintf(stderr, "handle_connection: unknown command tag %d\n", (int)cmd);
         break;
     }
+    return 0;
 }
 
 int main(void) {
@@ -925,11 +1545,42 @@ int main(void) {
     if (!have_encode) {
         fprintf(stderr, "No AMD/Intel VA-API encode on this host - encode requests will be rejected\n");
     }
+    if (have_encode) {
+        const char *backend = getenv("REDROID_FORGE_ENCODE_BACKEND");
+        int ffmpeg_requested = backend && strcmp(backend, "ffmpeg") == 0;
+#ifdef HAVE_HWDEC
+        if (ffmpeg_requested) {
+            g_ffmpeg_enc = ffmpeg_encode_open(DRM_RENDER_DEVICE);
+            g_backend_is_ffmpeg = (g_ffmpeg_enc != NULL);
+            if (!g_backend_is_ffmpeg)
+                fprintf(stderr, "encoder backend: ffmpeg requested but failed to open -- falling back to legacy\n");
+        }
+#else
+        if (ffmpeg_requested)
+            fprintf(stderr, "encoder backend: ffmpeg requested, but this daemon was compiled without HAVE_HWDEC -- using legacy\n");
+#endif
+        fprintf(stderr, "encoder backend: %s\n", g_backend_is_ffmpeg ? "ffmpeg (h264_vaapi)" : "legacy (hand-rolled bitstream)");
+    }
     int have_decode = (decode_h264_init() == 0);
     if (!have_decode) {
         fprintf(stderr, "No NVIDIA VA-API decode on this host - decode requests will be rejected\n");
     }
-    if (!have_encode && !have_decode) {
+    int have_hwdec = 0;
+#ifdef HAVE_HWDEC
+    {
+        HwDecCaps caps;
+        have_hwdec = (hwdec_probe(hwdec_node(), &caps) == 0);
+        if (have_hwdec) {
+            fprintf(stderr, "hwdec: %s; decodes in hardware:", caps.driver);
+            for (int i = 0; i < HWDEC_NCODECS; i++)
+                if (caps.supported[i]) fprintf(stderr, " %s%s", hwdec_codec_name((HwDecCodec)i), caps.supported_10bit[i] ? "(+10b)" : "");
+            fputc('\n', stderr);
+        } else {
+            fprintf(stderr, "hwdec: this host offers no hardware decode through VA-API\n");
+        }
+    }
+#endif
+    if (!have_encode && !have_decode && !have_hwdec) {
         fprintf(stderr, "Neither encode nor decode available on this host - nothing to do\n");
         return 1;
     }
@@ -937,8 +1588,24 @@ int main(void) {
     /* Parent directory is the shared bind-mount point between this host
      * process and the redroid container (see README.md) -- created here
      * so the daemon can run before that mount is even set up manually. */
-    mkdir("/dev/vaapi-helper", 0755);
-    unlink(VAAPI_DAEMON_SOCKET_PATH);
+    const char *socket_path = getenv("REDROID_FORGE_VAAPI_SOCKET");
+    if (!socket_path || !*socket_path) socket_path = VAAPI_DAEMON_SOCKET_PATH;
+    if (strcmp(socket_path, VAAPI_DAEMON_SOCKET_PATH) == 0) mkdir("/dev/vaapi-helper", 0755);
+    /* Never take the name away from a daemon that is alive (another forge on this host): that one would keep running but
+     * nobody could reach it. A socket nobody listens on is a leftover and is replaced. */
+    {
+        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un pa = {0};
+        pa.sun_family = AF_UNIX;
+        strncpy(pa.sun_path, socket_path, sizeof(pa.sun_path) - 1);
+        if (probe >= 0 && connect(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0) {
+            fprintf(stderr, "Another daemon is already listening on %s: not starting\n", socket_path);
+            close(probe);
+            return 1;
+        }
+        if (probe >= 0) close(probe);
+    }
+    unlink(socket_path);
 
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -947,17 +1614,17 @@ int main(void) {
     }
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, VAAPI_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror("bind");
         return 1;
     }
-    chmod(VAAPI_DAEMON_SOCKET_PATH, 0666);
+    chmod(socket_path, 0666);
     if (listen(listen_fd, 4) != 0) {
         perror("listen");
         return 1;
     }
-    fprintf(stderr, "Listening on %s\n", VAAPI_DAEMON_SOCKET_PATH);
+    fprintf(stderr, "Listening on %s\n", socket_path);
 
     while (1) {
         int conn_fd = accept(listen_fd, NULL, NULL);
@@ -966,8 +1633,7 @@ int main(void) {
             perror("accept");
             break;
         }
-        handle_connection(&st, have_encode, have_decode, conn_fd);
-        close(conn_fd);
+        if (!handle_connection(&st, have_encode, have_decode, conn_fd)) close(conn_fd);
     }
 
     close(listen_fd);

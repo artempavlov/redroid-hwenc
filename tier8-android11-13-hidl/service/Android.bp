@@ -1,0 +1,60 @@
+// HIDL port of redroid-hwenc's VA-API Codec2 IComponentStore service, for
+// Android 11/12/13 (see service.cpp's own comment: no AIDL Codec2 HAL exists
+// before Android 14, confirmed directly against AOSP source). Adapted from
+// AOSP's own empty-service template at
+// frameworks/av/media/codec2/hidl/services/Android.bp.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "android.hardware.media.c2@1.1-vaapi-service",
+    vendor: true,
+    relative_install_path: "hw",
+
+    init_rc: ["android.hardware.media.c2@1.1-vaapi-service.rc"],
+
+    defaults: ["libcodec2-hidl-defaults"],
+
+    srcs: [
+        "service.cpp",
+    ],
+
+    static_libs: [
+        "libvaapi_codec2_component",
+    ],
+
+    shared_libs: [
+        "libavservices_minijail",
+        "libbinder",
+        "libcodec2_soft_common",
+        "libstagefright_foundation",
+    ],
+    required: ["android.hardware.media.c2-vaapi-seccomp_policy"],
+
+    vintf_fragments: ["manifest_media_c2_vaapi.xml"],
+}
+
+prebuilt_etc {
+    name: "android.hardware.media.c2-vaapi-seccomp_policy",
+    vendor: true,
+    sub_dir: "seccomp_policy",
+
+    arch: {
+        arm: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm.policy",
+        },
+        arm64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-arm64.policy",
+        },
+        x86: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86.policy",
+        },
+        x86_64: {
+            src: "seccomp_policy/android.hardware.media.c2-default-x86_64.policy",
+        },
+    },
+
+    required: ["crash_dump.policy"],
+}
