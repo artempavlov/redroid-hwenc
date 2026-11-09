@@ -1,4 +1,4 @@
-# Tier 8: Android 11/12/13 (HIDL Codec2) — ⚠ work in progress
+# Tier 8: Android 11 (HIDL Codec2)
 
 Everything from Tier 4 onward (the Codec2 component, the daemon) targets Android 15 through the
 **AIDL** Codec2 HAL. That HAL does not exist before Android 14 — confirmed by inspecting AOSP
@@ -6,9 +6,23 @@ source directly at `android-11.0.0_r48`, `android-12.0.0_r34` and `android-13.0.
 `media/codec2/hal/aidl` only appears starting at `android-14.0.0_r75`; before that there is only
 `media/codec2/hidl/{1.0,1.1}`. This tier is a HIDL port of the same component code, plus one more
 AOSP-level fix those older versions need on any modern host kernel, to get the same hardware
-encode working on Android 11/12/13.
+encode working.
 
-## Status: confirmed working on AMD, confirmed broken on Intel
+**Android 12 and 13: assumed to work the same way, not separately tested.** This tier exists
+because of one single fact — no AIDL Codec2 before Android 14 — and that fact is confirmed
+identical at the 12 and 13 AOSP tags too, same as 11. Same gap, same fix, same component: there's
+no version-specific logic in here for 11 vs. 12 vs. 13, so the working assumption is that it just
+works there too. It's only validated on real hardware for 11, though, so if you run this on 12 or
+13 and hit something that doesn't work, that's exactly the kind of thing this assumption could be
+wrong about — [open an issue](https://github.com/fogelmanjg/redroid-hwenc/issues) with what you
+saw and it'll get looked at specifically, not treated as out of scope.
+
+**Just want an Android 11 instance with this working, not the component source?**
+[redroid-forge](https://github.com/fogelmanjg/redroid-forge)'s `hwenc` module is this exact
+component, wired into a real instance manager — `android-11-official` is one of its two catalog
+images.
+
+## Status: confirmed working on both AMD and Intel (Intel needs the ffmpeg backend)
 
 **AMD (Ryzen 5700G/Renoir), 08/11/2026 — confirmed, end to end, through the real module system of
 [redroid-forge](https://github.com/fogelmanjg/redroid-forge)** (not a hand-patched container: a
@@ -16,26 +30,26 @@ real `POST /instances` with `modules: ["hwenc"]` against a freshly created Andro
 A real VA-API hardware encode through `scrcpy`, confirmed via logcat (`VaapiEncComponent`), no
 crashes, h264 output decodes cleanly.
 
-**Intel (Iris Xe, TigerLake-LP), 08/11/2026 — confirmed broken, not just untested.** Same test,
-same plumbing (boots, registers, encodes, no crash) — but the output bitstream is malformed:
-`ffprobe`/`ffmpeg` report `Overread SPS by 3 bits` on every frame, a warning that does **not**
-appear at all on the AMD output. A simple screen (home screen, static icons) still decoded and
-looked correct despite the warning; content-heavy screens have not been tested yet, and the
-pattern of "simple content looks fine, real content doesn't" has already bitten this project once
-before (`redroid-nvidia`'s RTX 4060 texture corruption), so this is not assumed safe.
+**Intel (Iris Xe, TigerLake-LP), 08/11/2026 — confirmed broken on the default (`legacy`) backend,
+confirmed fixed on the `ffmpeg` backend (09/11/2026).** Same test, same plumbing (boots, registers,
+encodes, no crash) — but on `legacy` the output bitstream is malformed: `ffprobe`/`ffmpeg` report
+`Overread SPS by 3 bits` on every frame, a warning that does **not** appear at all on the AMD
+output. Switching the instance's encode backend to `ffmpeg` (the same libavcodec/`h264_vaapi`
+backend 5.16 added to fix Intel's P-frame bug) **clears the SPS warning entirely** — checked
+directly on the running instance, not inferred. So this *was* the same class of bug as 5.14's
+P-frame issue after all (see the correction below), and the fix is the same one-line config
+change, not a new patch to this component.
 
-**Do not assume this is the same root cause as Tier 5.14's Intel P-frame bug** (fixed in 5.16 by
-switching to a libavcodec-based encoder, see `tier5-vaapi-daemon/README.md`). That bug was in a
-hand-written slice header; this component does not write SPS/PPS bytes by hand at all — it scans
-the VA-API driver's own real coded output for where the parameter sets end
-(`findLeadingParameterSetsSize` in `VaapiEncComponent.cpp`), so an "overread" is more likely a
-boundary-detection bug in that scan than a bitstream construction bug. Worth checking that
-function specifically before assuming a full rewrite (5.16's fix) is needed here too.
-
-**Status for Android 12/13 specifically**: not run at all yet (no test hardware exercised beyond
-the Android 11 image so far). The AOSP source gap (no AIDL) is confirmed identical across all
-three versions, so the same component/patch is expected to apply, but "expected" is not "run" —
-treat 12/13 as unverified until someone actually boots one.
+**Correction, 09/11/2026 (the paragraph below is kept for the record, but its conclusion was
+wrong):** this file originally argued the SPS bug was *probably not* the same root cause as
+5.14's P-frame bug, because this component scans the driver's own coded output
+(`findLeadingParameterSetsSize` in `VaapiEncComponent.cpp`) instead of writing SPS/PPS bytes by
+hand — unlike `daemon.c`'s legacy path. That reasoning was never actually tested against the
+`ffmpeg` backend; once it was, the bug disappeared. Read as: Intel's VA-API driver produces coded
+output that both the hand-written legacy path *and* this component's own boundary scan handle
+incorrectly, and libavcodec's encoder sidesteps whatever that Intel-specific quirk is in both
+cases — a property of the driver's output, not of which piece of this project's own code consumes
+it.
 
 ## What's here
 
@@ -113,8 +127,9 @@ the real `sys.boot_completed=1` signal first, not a proxy for it.
 
 ## What's next
 
-1. The Intel SPS bug — check `findLeadingParameterSetsSize` first, before assuming a libavcodec
-   rewrite (Tier 5.16's fix for an unrelated bug) is the answer here too.
-2. Actually run this on Android 12 and 13, not just 11.
-3. `VaapiDecComponent` (hwdec, the HIDL side) has not been exercised at all yet — only encode has
-   a real validation run so far.
+1. ~~The Intel SPS bug~~ **Resolved 09/11/2026**: use the `ffmpeg` encode backend on Intel, same
+   as 5.14/5.16. `findLeadingParameterSetsSize` itself was never actually the bug.
+2. Android 12/13 — assumed to work (see the note at the top), not separately validated on
+   hardware. `VaapiDecComponent` (hwdec, the HIDL side) also hasn't been exercised at all yet.
+   Neither is being chased proactively; a real issue report on either is what triggers picking it
+   up.

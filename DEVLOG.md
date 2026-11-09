@@ -2047,3 +2047,37 @@ Also found and fixed in the same validation pass: a real boot-ordering race in h
 `setprop` gets applied on Android 11 — a readiness proxy that wasn't the real
 `sys.boot_completed=1` signal let it apply with no error and then get silently reset moments
 later by a later boot step.
+
+## 2026-11-09 — Tier 8's Intel SPS bug: same class as 5.14's P-frame bug after all, fixed by the ffmpeg backend
+
+The previous entry's hedge ("probably not the same root cause as 5.14, this component scans the
+driver's own output instead of writing SPS/PPS by hand") was never actually tested against the
+`ffmpeg` backend — it was reasoning from how the two code paths are built, not from a result.
+Tested directly on the Intel (Iris Xe) instance from the Tier 8 validation: switching the running
+instance's encode backend from `legacy` to `ffmpeg` (5.16, libavcodec/`h264_vaapi`) makes the
+`Overread SPS by 3 bits` warning disappear completely — checked with `ffprobe` against real
+`scrcpy` output, not inferred from the code. Read as: this is a property of what Intel's VA-API
+driver actually hands back as "coded output" that both the hand-written legacy path *and* this
+HIDL component's own boundary-detection scan mishandle the same way; libavcodec's encoder
+sidesteps it in both cases. Tier 8's README updated to drop the "do not assume" hedge and record
+the actual fix (use the `ffmpeg` backend on Intel) instead of leaving it as an open question.
+
+**Scope decision on the same day: Tier 8 is marked done for Android 11, not "work in progress."**
+With both GPUs this project has access to now confirmed working on Android 11, the user decided
+not to keep the tier open-ended waiting on 12/13. Framing matters here, per the user directly:
+this is not "12/13 are unsupported, you're on your own" — it's "12/13 are assumed to work, since
+it's the exact same AOSP-source gap (no AIDL before 14) and the exact same fix, with nothing
+version-specific in the component itself; they just haven't been run on real hardware yet." If
+that assumption turns out wrong for someone, a GitHub issue describing what broke is what triggers
+actually looking at it — not a self-imposed checklist item sitting here unexercised, and not a
+"not our problem" either. Same framing applies to `VaapiDecComponent` (HIDL decode): open, not
+being chased proactively, but not written off.
+
+**Also added in this pass: an explicit, prominent pointer from this repo to
+[redroid-forge](https://github.com/fogelmanjg/redroid-forge)** (top of `README.md`, and again in
+Tier 8's own README, since people may land there directly from a search result or a link).
+Deliberate, at the user's request: this repo is the research/reverse-engineering side of the
+story; redroid-forge is where someone who just wants a working Android container should actually
+land. The two were always related (redroid-forge's `hwenc`/`hwdec` modules ARE this project's
+code, consumed as a dependency) but that relationship was never stated plainly for a reader
+arriving at this repo cold.

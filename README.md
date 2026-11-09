@@ -8,6 +8,13 @@
 
 Hardware video encoding (H.264/H.265, via VA-API) for [redroid](https://github.com/remote-android/redroid-doc).
 
+> **Just want this working?** This project's code is what powers the `hwenc`/`hwdec` modules of
+> [**redroid-forge**](https://github.com/fogelmanjg/redroid-forge), a full Android-container
+> manager built on top of it (GApps, ARM translation, WiFi, backups, a real UI). If you want a
+> working instance, start there — this repo is where the underlying reverse-engineering gets done
+> and documented, tier by tier, for anyone who wants to understand or build on the research
+> itself, not just use the result.
+
 ## The problem
 
 BlueStacks, Nox and MuMu have no real equivalent on Linux desktop. [redroid](https://github.com/remote-android/redroid-doc)
@@ -52,7 +59,7 @@ subfolder README, linked below.
 - [x] **Tier 5 — ⭐ Real integration. The actual goal.** A real, unmodified app (`scrcpy`) records correct hardware-encoded H.264 through the genuine framework path — confirmed on 3 GPUs across AMD/Intel (see Hardware compatibility below). Later additions: real P frames (5.14, broken on Intel), vendor-agnostic hardware decode for apps (5.15), and a second, libavcodec-based encode backend that fixes the Intel P-frame bug (5.16). → [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md)
 - [x] **Tier 6 (conditional on Tier 0).** Turned out unnecessary — Tier 0 already confirmed codec selection is capability-based, so `scrcpy` picks up the new encoder automatically.
 - [x] **Tier 7 — ⭐ Hardware video decode, a fourth GPU (NVIDIA).** Bit-exact NVDEC decode via VA-API, fully wired into the daemon and a real `c2.hardware.decoder.h264` Codec2 component (see Hardware compatibility below). **Next**: the real-device `MediaCodec` test, the same milestone Tier 5 needed for encode. → [tier6-vaapi-decode/README.md](tier6-vaapi-decode/README.md), [tier5-vaapi-daemon/README.md](tier5-vaapi-daemon/README.md)
-- [ ] **Tier 8 — Android 11/12/13 (HIDL Codec2), ⚠ work in progress.** AIDL Codec2 (what Tiers 4–7 are built on) does not exist before Android 14 — confirmed against AOSP source at android-11.0.0_r48, 12.0.0_r34 and 13.0.0_r83. A HIDL port of the same component, plus a kernel-level `libion.so` fix these older AOSP versions need on any modern host kernel, gets the same hardware encode working — **confirmed end to end, but only on AMD** (Ryzen 5700G/Renoir). **Intel is confirmed broken**, not just untested: a real, malformed-bitstream bug (`Overread SPS by N bits`), still being investigated as of 08/11/2026 — not assumed to be the same root cause as 5.14's Intel P-frame bug (this component passes through the driver's own coded bytes rather than writing them by hand), so 5.16's ffmpeg rewrite is not assumed to be the fix without checking first. → [tier8-android11-13-hidl/README.md](tier8-android11-13-hidl/README.md)
+- [x] **Tier 8 — Android 11 (HIDL Codec2).** AIDL Codec2 (what Tiers 4–7 are built on) does not exist before Android 14 — confirmed against AOSP source at android-11.0.0_r48, 12.0.0_r34 and 13.0.0_r83. A HIDL port of the same component, plus a kernel-level `libion.so` fix these older AOSP versions need on any modern host kernel, gets the same hardware encode working — **confirmed end to end on Android 11, on both AMD (Ryzen 5700G/Renoir) and Intel (Iris Xe)**. Intel needed the `ffmpeg` encode backend (5.16) to fix a malformed-bitstream bug (`Overread SPS by N bits`) on the default backend — confirmed 09/11/2026 to be the same class of Intel-specific issue as 5.14's P-frame bug, not a separate one as first suspected. **Android 12/13 are assumed to work the same way, not separately tested** — same AOSP-source gap, same fix, no version-specific logic in the component itself, so there's no reason to expect it to behave differently there. It just hasn't been run on real 12/13 hardware yet. If you do and hit something that doesn't work, that's exactly what the assumption could be missing — open an issue with what you saw and it'll be looked at specifically. The HIDL decode side (`VaapiDecComponent`) also hasn't been exercised yet, same situation. → [tier8-android11-13-hidl/README.md](tier8-android11-13-hidl/README.md)
 
 Even if it doesn't go further, each tier on its own is a publishable contribution — none of this
 has been documented by anyone until now.
