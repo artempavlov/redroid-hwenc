@@ -1,4 +1,9 @@
-# redroid-hwenc
+# redroid-hwenc — Intel Haswell fork
+
+> **Intel Haswell support in this fork:** see [intel/README.md](intel/README.md)
+> for the HD Graphics 4400/i965 profile, cros/minigbm handle adaptation,
+> tested v0.2.0 binary patcher, build instructions and verification limits.
+> The upstream project and its original research are credited below.
 
 **Languages:** English | [Español](README.es.md) | [中文](README.zh-CN.md)
 
